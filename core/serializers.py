@@ -1,12 +1,13 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
 from .models import Wallet,Market,Outcome,Position,WalletTransaction,Order,Trade
-
+from django.contrib.auth.password_validation import validate_password
 
 
 class RegisterSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only = True)
-    class Meta :
+    password = serializers.CharField(write_only=True)
+
+    class Meta:
         model = User
         fields = [
             "id",
@@ -14,9 +15,22 @@ class RegisterSerializer(serializers.ModelSerializer):
             "email",
             "password"
         ]
-    
-    def create(self,validated_data):
+
+    def validate_email(self, value):
+        value = value.lower()
+
+        if User.objects.filter(email=value).exists():
+            raise serializers.ValidationError("Email already exists.")
+
+        return value
+
+    def validate_password(self, value):
+        validate_password(value)
+        return value
+
+    def create(self, validated_data):
         return User.objects.create_user(**validated_data)
+
     
 
 class LoginSerializer(serializers.Serializer):
@@ -52,124 +66,3 @@ class WalletSerializer(serializers.ModelSerializer):
         ]
 
 
-class MarketSerializer(serializers.ModelSerializer):
-    class Meta : 
-        model = Market
-        fields = [
-            "title",
-            "description",
-            "close_at"
-        ]
-
-
-class MarketOutputSerializer(serializers.ModelSerializer):
-    class Meta : 
-        model = Market
-        fields = [
-            "id",
-            "title",
-            "description",
-            "status",
-            "close_at"
-        ]
-
-
-class OutcomeSerializer(serializers.ModelSerializer):
-
-    class Meta :
-        model = Outcome
-        fields = [
-            "id",
-            "name"
-        ]
-
-class MarketDetailSerializer(serializers.ModelSerializer):
-    outcomes = OutcomeSerializer(many = True,read_only = True)
-
-    class Meta :
-        model = Market
-        fields = [
-            "id",
-            "title",
-            "description",
-            "status",
-            "close_at",
-            "outcomes"
-
-        ]
-
-
-class PlaceOrderSerializer(serializers.ModelSerializer):
-    pass
-
-
-class MergeSerializer(serializers.Serializer):
-
-    quantity = serializers.PositiveIntegerField()
-
-
-
-class ResolveMarketSerializer(serializers.Serializer):
-
-    winner = serializers.ChoiceField(
-        choices=["YES","NO"]
-    )
-
-
-class PortfolioSerializer(serializers.ModelSerializer):
-    market = serializers.CharField(source = "outcome.market.title")
-    outcome = serializers.CharField(source = "outcome.name")
-    class Meta : 
-        model = Position
-        fields = [
-            "quantity",
-            "average_price",
-            "outcome",
-            "market"
-        ]
-
-
-
-class TransactionSerializer(serializers.ModelSerializer):
-
-    class Meta :
-        model = WalletTransaction
-        fields = [
-            "transaction_type",
-            "amount",
-            "description",
-            "created_at"
-        ]
-       
-
-
-
-
-
-class MyOrdersSerializer(serializers.ModelSerializer):
-
-    market = serializers.CharField(source = "outcome.market.title")
-    outcome = serializers.CharField(source = "outcome.name")
-    class Meta :
-        model = Order
-        fields = [
-            "id",
-            "market",
-            "outcome",
-            "order_type",
-            "price",
-            "quantity",
-            "remaining_quantity",
-            "status",
-            "created_at"
-        ]
-
-class TradeSerializer(serializers.ModelSerializer):
-
-    class Meta:
-        model = Trade
-        fields = [
-            "price",
-            "quantity",
-            "executed_at"
-        ]
