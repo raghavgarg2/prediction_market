@@ -1,36 +1,51 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
-from .models import Wallet,Market,Outcome,Position,WalletTransaction,Order,Trade
+from .models import Wallet
 from django.contrib.auth.password_validation import validate_password
+from rest_framework.validators import UniqueValidator
 
 
 class RegisterSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True)
+
+    password = serializers.CharField(
+        write_only=True,
+    )
+
+    email = serializers.EmailField(
+        validators=[
+            UniqueValidator(
+                queryset=User.objects.all(),
+                message="Email already exists.",
+            )
+        ],
+    )
 
     class Meta:
+
         model = User
+
         fields = [
             "id",
             "username",
             "email",
-            "password"
+            "password",
         ]
 
     def validate_email(self, value):
-        value = value.lower()
 
-        if User.objects.filter(email=value).exists():
-            raise serializers.ValidationError("Email already exists.")
-
-        return value
+        return value.lower()
 
     def validate_password(self, value):
+
         validate_password(value)
+
         return value
 
     def create(self, validated_data):
-        return User.objects.create_user(**validated_data)
 
+        return User.objects.create_user(
+            **validated_data,
+        )
     
 
 class LoginSerializer(serializers.Serializer):
@@ -42,7 +57,7 @@ class LoginSerializer(serializers.Serializer):
 
 
 class DepositSerializer(serializers.Serializer):
-    amount = serializers.DecimalField(max_digits=12,decimal_places=2, default=0,min_value=0.01)
+    amount = serializers.DecimalField(max_digits=12,decimal_places=2,min_value=0.01)
 
 
 

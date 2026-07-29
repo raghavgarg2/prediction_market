@@ -8,12 +8,13 @@ from rest_framework.views import APIView
 from django.db import transaction
 from .models import Outcome,Market,Position,Order,Trade
 from core.models import Wallet,WalletTransaction
-from .serializers import MarketSerializer,CreateMarketSerializer,MarketDetailSerializer,SplitSerializer,MergeSerializer,ResolveMarketSerializer,PortfolioSerializer,MyOrdersSerializer,TransactionSerializer,TradeSerializer
+from .serializers import MarketSerializer,CreateMarketSerializer,MarketDetailSerializer,SplitSerializer,MergeSerializer,ResolveMarketSerializer,PortfolioSerializer,MyOrdersSerializer,TransactionSerializer,TradeSerializer,PlaceOrderSerializer
 from rest_framework.response import Response
 from rest_framework import status
 from decimal import Decimal
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.db.models import Sum
 
 
 
@@ -535,3 +536,676 @@ class TradeHistoryAPIView(APIView):
             {"trades": serializer.data},
             status=status.HTTP_200_OK,
         )
+
+
+    
+class PlaceOrderAPIView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+
+        serializer = PlaceOrderSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        outcome = serializer.validated_data["outcome"]
+        order_type = serializer.validated_data["order_type"]
+        price = serializer.validated_data["price"]
+        quantity = serializer.validated_data["quantity"]
+
+        with transaction.atomic():
+
+            market = get_object_or_404(
+                   Market.objects.select_for_update(),
+                   id=pk,
+            )
+
+            if market.status != Market.Status.OPEN:
+                return Response(
+                    {"msg": "market is closed."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if outcome.market_id != market.id:
+                return Response(
+                    {"msg": "invalid outcome."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            wallet = (
+                Wallet.objects
+                .select_for_update()
+                .get(user=request.user)
+            )
+            
+
+            if order_type == Order.OrderType.BUY:
+
+                total_amount = price * quantity
+
+                if wallet.available_balance < total_amount:
+                    return Response(
+                        {"msg": "insufficient balance"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                wallet.available_balance -= total_amount
+                wallet.locked_balance += total_amount
+
+                wallet.save(
+                    update_fields=[
+                        "available_balance",
+                        "locked_balance",
+                    ]
+                )
+
+                created_order = Order.objects.create(
+                    user=request.user,
+                    outcome=outcome,
+                    order_type=Order.OrderType.BUY,
+                    price=price,
+                    quantity=quantity,
+                    remaining_quantity=quantity,
+                    status=Order.Status.OPEN,
+                )
+
+                matching_orders = (
+                    Order.objects
+                    .select_for_update()
+                    .select_related("user")
+                    .filter(
+                        outcome=outcome,
+                        order_type=Order.OrderType.SELL,
+                        price__lte=price,
+                        status__in=[
+                            Order.Status.OPEN,
+                            Order.Status.PARTIALLY_FILLED,
+                        ],
+                    )
+                    .order_by(
+                        "price",
+                        "created_at",
+                    )
+                )
+
+                remaining_quantity = quantity
+                buyer_position = (
+                    Position.objects
+                    .select_for_update()
+                    .filter(
+                        user=request.user,
+                        outcome=outcome,
+                    )
+                    .first()
+                )
+
+                for order in matching_orders:
+
+                    if remaining_quantity == 0:
+                        break
+
+                    seller_position = (
+                        Position.objects
+                        .select_for_update()
+                        .get(
+                            user=order.user,
+                            outcome=outcome,
+                        )
+                    )
+
+
+                    if order.remaining_quantity >= remaining_quantity:
+
+                        traded_quantity = remaining_quantity
+
+                        created_order.remaining_quantity = 0
+                        created_order.status = Order.Status.FILLED
+
+                        order.remaining_quantity -= traded_quantity
+
+                        if order.remaining_quantity == 0:
+                            order.status = Order.Status.FILLED
+                        else:
+                            order.status = Order.Status.PARTIALLY_FILLED
+
+                    else:
+
+                        traded_quantity = order.remaining_quantity
+
+                        created_order.remaining_quantity -= traded_quantity
+
+                        created_order.status = (
+                            Order.Status.PARTIALLY_FILLED
+                        )
+
+                        order.remaining_quantity = 0
+                        order.status = Order.Status.FILLED
+
+                    order.save(
+                        update_fields=[
+                            "remaining_quantity",
+                            "status",
+                        ]
+                    )
+
+                    created_order.save(
+                        update_fields=[
+                            "remaining_quantity",
+                            "status",
+                        ]
+                    )
+
+                    Trade.objects.create(
+                        buy_order=created_order,
+                        sell_order=order,
+                        price=order.price,
+                        quantity=traded_quantity,
+                    )
+
+                    if buyer_position is None:
+
+                        buyer_position = Position.objects.create(
+                            user=request.user,
+                            outcome=outcome,
+                            quantity=traded_quantity,
+                            average_price=order.price,
+                        )
+
+                    else:
+
+                        total_quantity = (
+                            buyer_position.quantity + traded_quantity
+                        )
+
+                        buyer_position.average_price = (
+                            (
+                                buyer_position.average_price
+                                * buyer_position.quantity
+                            )
+                            + (order.price * traded_quantity)
+                        ) / total_quantity
+
+                        buyer_position.quantity = total_quantity
+
+                        buyer_position.save(
+                            update_fields=[
+                                "average_price",
+                                "quantity",
+                            ]
+                        )
+
+                    seller_position.quantity -= traded_quantity
+                    seller_position.locked_quantity -= traded_quantity
+
+                    if seller_position.quantity == 0:
+                        seller_position.delete()
+                    else:
+                        seller_position.save(
+                            update_fields = [
+                                "quantity",
+                                "locked_quantity"
+                            ]
+                        )
+
+
+                    WalletTransaction.objects.create(
+                        wallet=wallet,
+                        transaction_type=WalletTransaction.TransactionType.BUY,
+                        amount=order.price * traded_quantity,
+                        description=(
+                            f"Bought {traded_quantity} shares of "
+                            f"{outcome.name} at {order.price}"
+                        ),
+                    )
+
+                    seller_wallet = (
+                        Wallet.objects
+                        .select_for_update()
+                        .get(user=order.user)
+                    )
+
+                    WalletTransaction.objects.create(
+                        wallet=seller_wallet,
+                        transaction_type=WalletTransaction.TransactionType.SELL,
+                        amount=order.price * traded_quantity,
+                        description=(
+                            f"Sold {traded_quantity} shares of "
+                            f"{outcome.name} at {order.price}"
+                        ),
+                    )
+
+                    reserved_price = created_order.price
+                    trade_price = order.price
+
+                    wallet.locked_balance -= (
+                        reserved_price * traded_quantity
+                    )
+
+                    wallet.available_balance += (
+                        (reserved_price - trade_price)
+                        * traded_quantity
+                    )
+
+                    seller_wallet.available_balance += (
+                        trade_price * traded_quantity
+                    )
+
+                    wallet.save(
+                        update_fields=[
+                            "available_balance",
+                            "locked_balance",
+                        ]
+                    )
+
+                    seller_wallet.save(
+                        update_fields=[
+                            "available_balance",
+                        ]
+                    )
+
+                    remaining_quantity -= traded_quantity
+
+                return Response(
+                    {
+                        "msg": "Order placed successfully.",
+                        "order_id": created_order.id,
+                    },
+                    status=status.HTTP_201_CREATED,
+                )
+
+            # sell flow
+            else:
+
+                seller_position = (
+                    Position.objects
+                    .select_for_update()
+                    .filter(
+                        user=request.user,
+                        outcome=outcome,
+                    )
+                    .first()
+                )
+
+                if seller_position is None:
+                    return Response(
+                        {"msg": "You don't own this outcome."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                available_quantity = (
+                    seller_position.quantity
+                    - seller_position.locked_quantity
+                )
+
+                if available_quantity < quantity:
+                    return Response(
+                        {"msg": "You don't have enough shares."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                seller_position.locked_quantity += quantity
+
+                seller_position.save(
+                    update_fields=[
+                        "locked_quantity",
+                    ]
+                )
+
+                wallet = (
+                    Wallet.objects
+                    .select_for_update()
+                    .get(user=request.user)
+                )
+
+                created_order = Order.objects.create(
+                    user=request.user,
+                    outcome=outcome,
+                    order_type=Order.OrderType.SELL,
+                    price=price,
+                    quantity=quantity,
+                    remaining_quantity=quantity,
+                    status=Order.Status.OPEN,
+                )
+
+                matching_orders = (
+                    Order.objects
+                    .select_for_update()
+                    .select_related("user")
+                    .filter(
+                        outcome=outcome,
+                        order_type=Order.OrderType.BUY,
+                        price__gte=price,
+                        status__in=[
+                            Order.Status.OPEN,
+                            Order.Status.PARTIALLY_FILLED,
+                        ],
+                    )
+                    .order_by(
+                        "-price",
+                        "created_at",
+                    )
+                )
+
+                remaining_quantity = quantity
+
+                for order in matching_orders:
+
+                    if remaining_quantity == 0:
+                        break
+
+                    buyer_position = (
+                        Position.objects
+                        .select_for_update()
+                        .filter(
+                            user=order.user,
+                            outcome=outcome,
+                        )
+                        .first()
+                    )
+
+                    traded_quantity = min(
+                        remaining_quantity,
+                        order.remaining_quantity,
+                    )
+
+                    created_order.remaining_quantity -= traded_quantity
+                    order.remaining_quantity -= traded_quantity
+
+                    if created_order.remaining_quantity == 0:
+                        created_order.status = Order.Status.FILLED
+                    else:
+                        created_order.status = (
+                            Order.Status.PARTIALLY_FILLED
+                        )
+
+                    if order.remaining_quantity == 0:
+                        order.status = Order.Status.FILLED
+                    else:
+                        order.status = (
+                            Order.Status.PARTIALLY_FILLED
+                        )
+
+                    created_order.save(
+                        update_fields=[
+                            "remaining_quantity",
+                            "status",
+                        ]
+                    )
+
+                    order.save(
+                        update_fields=[
+                            "remaining_quantity",
+                            "status",
+                        ]
+                    )
+
+                    Trade.objects.create(
+                        buy_order=order,
+                        sell_order=created_order,
+                        price=order.price,
+                        quantity=traded_quantity,
+                    )
+
+                    if buyer_position is None:
+
+                        buyer_position = Position.objects.create(
+                            user=order.user,
+                            outcome=outcome,
+                            quantity=traded_quantity,
+                            average_price=order.price,
+                        )
+
+                    else:
+
+                        old_quantity = buyer_position.quantity
+                        new_quantity = (
+                            old_quantity + traded_quantity
+                        )
+
+                        buyer_position.average_price = (
+                            (
+                                buyer_position.average_price
+                                * old_quantity
+                            )
+                            + (
+                                order.price
+                                * traded_quantity
+                            )
+                        ) / new_quantity
+
+                        buyer_position.quantity = new_quantity
+
+                        buyer_position.save(
+                            update_fields=[
+                                "average_price",
+                                "quantity",
+                            ]
+                        )
+
+                    seller_position.quantity -= traded_quantity
+                    seller_position.locked_quantity -= traded_quantity
+
+                    if seller_position.quantity == 0:
+                        seller_position.delete()
+                    else:
+                        seller_position.save(
+                            update_fields=[
+                                "quantity",
+                                "locked_quantity",
+                            ]
+                        )
+
+                    buyer_wallet = (
+                        Wallet.objects
+                        .select_for_update()
+                        .get(user=order.user)
+                    )
+
+                    reserved_price = order.price
+                    trade_price = order.price
+
+                    buyer_wallet.locked_balance -= (
+                        reserved_price
+                        * traded_quantity
+                    )
+
+                    buyer_wallet.available_balance += (
+                        (
+                            reserved_price
+                            - trade_price
+                        )
+                        * traded_quantity
+                    )
+
+                    wallet.available_balance += (
+                        trade_price
+                        * traded_quantity
+                    )
+
+                    buyer_wallet.save(
+                        update_fields=[
+                            "available_balance",
+                            "locked_balance",
+                        ]
+                    )
+
+                    wallet.save(
+                        update_fields=[
+                            "available_balance",
+                        ]
+                    )
+
+                    WalletTransaction.objects.create(
+                        wallet=buyer_wallet,
+                        transaction_type=WalletTransaction.TransactionType.BUY,
+                        amount=trade_price * traded_quantity,
+                        description=(
+                            f"Bought {traded_quantity} shares of "
+                            f"{outcome.name} at {trade_price}"
+                        ),
+                    )
+
+                    WalletTransaction.objects.create(
+                        wallet=wallet,
+                        transaction_type=WalletTransaction.TransactionType.SELL,
+                        amount=trade_price * traded_quantity,
+                        description=(
+                            f"Sold {traded_quantity} shares of "
+                            f"{outcome.name} at {trade_price}"
+                        ),
+                    )
+
+                    remaining_quantity -= traded_quantity
+
+                return Response(
+                    {
+                        "msg": "Order placed successfully.",
+                        "order_id": created_order.id,
+                    },
+                    status=status.HTTP_201_CREATED,
+                )
+
+
+class CancelOrderAPIView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+
+        with transaction.atomic():
+
+            order = get_object_or_404(
+                Order.objects.select_for_update(),
+                id=pk,
+                user=request.user,
+            )
+
+            if order.status not in [
+                Order.Status.OPEN,
+                Order.Status.PARTIALLY_FILLED,
+            ]:
+                return Response(
+                    {"msg": "Cannot cancel order."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if order.order_type == Order.OrderType.BUY:
+
+                wallet = (
+                    Wallet.objects
+                    .select_for_update()
+                    .get(user=request.user)
+                )
+
+                refund_amount = (
+                    order.price
+                    * order.remaining_quantity
+                )
+
+                wallet.locked_balance -= refund_amount
+                wallet.available_balance += refund_amount
+
+                wallet.save(
+                    update_fields=[
+                        "locked_balance",
+                        "available_balance",
+                    ]
+                )
+
+                WalletTransaction.objects.create(
+                    wallet=wallet,
+                    transaction_type=WalletTransaction.TransactionType.REFUND,
+                    amount=refund_amount,
+                    description="Order cancelled. Funds refunded.",
+                )
+
+            else:
+
+                position = (
+                    Position.objects
+                    .select_for_update()
+                    .get(
+                        user=request.user,
+                        outcome=order.outcome,
+                    )
+                )
+
+                position.locked_quantity -= (
+                    order.remaining_quantity
+                )
+
+                position.save(
+                    update_fields=[
+                        "locked_quantity",
+                    ]
+                )
+
+            order.status = Order.Status.CANCELLED
+
+            order.save(
+                update_fields=[
+                    "status",
+                ]
+            )
+
+        return Response(
+            {
+                "msg": "Order cancelled successfully.",
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+
+class OrderBookAPIView(APIView):
+
+    def get(self, request, pk):
+
+        market = get_object_or_404(
+            Market,
+            id=pk,
+        )
+
+        data = {}
+
+        for outcome in market.outcomes.all():
+
+            buy_orders = (
+                Order.objects
+                .filter(
+                    outcome=outcome,
+                    order_type=Order.OrderType.BUY,
+                    status__in=[
+                        Order.Status.OPEN,
+                        Order.Status.PARTIALLY_FILLED,
+                    ],
+                )
+                .values("price")
+                .annotate(
+                    quantity=Sum("remaining_quantity"),
+                )
+                .order_by("-price")
+            )
+
+            sell_orders = (
+                Order.objects
+                .filter(
+                    outcome=outcome,
+                    order_type=Order.OrderType.SELL,
+                    status__in=[
+                        Order.Status.OPEN,
+                        Order.Status.PARTIALLY_FILLED,
+                    ],
+                )
+                .values("price")
+                .annotate(
+                    quantity=Sum("remaining_quantity"),
+                )
+                .order_by("price")
+            )
+
+            data[outcome.name] = {
+                "BUY": buy_orders,
+                "SELL": sell_orders,
+            }
+
+        return Response(data)

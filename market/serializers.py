@@ -137,3 +137,18 @@ class TradeSerializer(serializers.ModelSerializer):
             "quantity",
             "executed_at",
         ]
+
+
+class PlaceOrderSerializer(serializers.Serializer):
+
+    outcome = serializers.ChoiceField(choices=Outcome.OutcomeName.choices)
+
+    order_type = serializers.ChoiceField(choices=Order.OrderType.choices)
+
+    price = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=Decimal("0.01"),
+    )
+
+    quantity = serializers.IntegerField(min_value=1)
